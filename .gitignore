@@ -1,0 +1,23 @@
+# --- data: never upload images (large, and GenImage is CC BY-NC-SA) ---
+data/
+genimage_tmp/
+*.zip
+*.z[0-9][0-9]
+
+# --- cached CLIP features (large, regenerated automatically) ---
+manifests*/feats_*/
+*.npz
+*.npy
+
+# --- Python / editor ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.vscode/
+.idea/
+
+# --- credentials ---
+kaggle.json
+access_token
+.env
