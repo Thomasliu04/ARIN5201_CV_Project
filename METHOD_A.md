@@ -1,281 +1,301 @@
-# Method A：用裁剪代替缩放的预处理模块（Crop-instead-of-Resize）
+# Method A: Crop-instead-of-Resize Preprocessing
 
 > ARIN5201 Project 6 · AI-Generated Image Detection
-> 负责人：Thomas · 文档版本 v1（2026-11-04）
-> 相关代码：`scripts/train_baseline.py`（`--preprocess crop`）、`scripts/make_bias_testsets.py`、`scripts/compare_results.py`
+> Owner: Thomas · Document version v2 (2026-11-04)
+> Code: `scripts/train_baseline.py` (`--preprocess crop`, `--train-jpeg`), `scripts/make_bias_testsets.py`, `scripts/compare_results.py`
 
 ---
 
-## 1. 一句话概括
+## 1. Summary
 
-我们发现，在 GenImage 上训练的 CLIP 线性探针检测器，主要依赖**分辨率/清晰度捷径**（"糊 = 假"），而不是生成痕迹。Method A 把 CLIP 默认的"缩放到 224"换成"**不缩放、直接裁剪**"，从预处理层面消除这条捷径，并在未见生成器和偏差控制测试集上验证效果。
+A CLIP linear-probe detector trained on GenImage relies mainly on a **resolution / sharpness shortcut** ("blurry = fake") rather than on generation artifacts. Method A replaces CLIP's default "resize to 224" with "**no resizing, crop only**" to remove this shortcut at the preprocessing level, and evaluates the effect on unseen generators and on bias-controlled test sets.
+
+**Outcome (see §10–12):** in our setting, cropping does not beat resizing combined with training-time JPEG augmentation. Method A is therefore reported as a negative result, but the experiments show *why*: the preprocessing choice decides which dataset bias the model exploits.
 
 ---
 
-## 2. 与课程 guideline 的对应关系
+## 2. Mapping to the course guidelines
 
-| Guideline 原文（Section 6） | 本方法的对应内容 |
+| Guideline (Section 6) | Corresponding work |
 |---|---|
-| 6.4.1 Step 2：Select a base model (pre-trained CNNs or ViTs) | 以 UnivFD（冻结 CLIP ViT + 线性分类器）为起点 |
-| 6.4.1 Step 3：Design the training framework, including **data preprocessing** | Method A 本身就是预处理模块的替换 |
-| 6.4.1 Step 4：Test on hold-out, unseen, and perturbed data | `test_seen` / `test_unseen_*` / 9 组退化测试 |
-| 6.4.3：**Address dataset bias and ensure fair evaluation across image types** | 偏差分析 + 偏差控制测试集（第 3、5 节） |
-| 6.4.3：Handle diverse generative methods (GANs, Diffusion Models) | BigGAN（GAN）+ ADM（扩散），后续加入 SD1.4、GLIDE |
-| 6.4.3：Maintain robustness against image transformations | JPEG 90/70/50、模糊 σ=0.5/1/2、降采样 75/50/25% |
-| 6.2.1 Input：JPEG/PNG with varying sources | 格式对齐测试（真图 JPEG vs 假图 PNG） |
+| 6.4.1 Step 2: Select a base model (pre-trained CNNs or ViTs) | Starting point: UnivFD (frozen CLIP ViT + linear classifier) |
+| 6.4.1 Step 3: Design the training framework, including **data preprocessing** | Method A replaces the preprocessing module |
+| 6.4.1 Step 4: Test on hold-out, unseen, and perturbed data | `test_seen` / `test_unseen_*` / 9 degradation sets |
+| 6.4.3: **Address dataset bias and ensure fair evaluation across image types** | Bias analysis + bias-controlled test sets (§3, §5) |
+| 6.4.3: Handle diverse generative methods (GANs, Diffusion Models) | BigGAN (GAN), ADM and GLIDE (diffusion) |
+| 6.4.3: Maintain robustness against image transformations | JPEG 90/70/50, blur σ = 0.5/1/2, downsampling 75/50/25% |
+| 6.2.1 Input: JPEG/PNG with varying sources | Format-alignment tests (real JPEG vs fake PNG) |
 
-老师的三条建议：
-1. **不过度野心**：只替换预处理，不训练大模型；冻结 CLIP + 线性分类器在笔记本 GPU（RTX 5070 Ti, 12GB）上几分钟可跑完。
-2. **方案不是由 AI 直接给出**：动机来自我们自己的实验证据（第 3 节）；参考了 SAFE 等论文的做法（第 8 节）。
-3. **以开源模型为起点做模块替换**：起点 UnivFD（开源），改进点是预处理模块。
+The instructor's three tips:
+1. **Not too ambitious**: only the preprocessing is replaced and no large model is trained; frozen CLIP + a linear classifier runs in minutes on a laptop GPU (RTX 5070 Ti, 12 GB).
+2. **The method is not handed over by an AI tool**: the motivation comes from our own experimental evidence (§3); the cropping idea follows published work such as SAFE (§8).
+3. **Start from an open-source model and replace a module**: starting point UnivFD (open source); the replaced module is the preprocessing.
 
 ---
 
-## 3. 动机：实验证据
+## 3. Motivation: experimental evidence
 
-### 3.1 数据格式与尺寸（`inspect_genimage.py`，每个文件夹抽查 500 张）
+### 3.1 File format and size (`inspect_genimage.py`, 500 images sampled per folder)
 
-| 文件夹 | 格式 | 色度采样 | 主要尺寸 |
+| Folder | Format | Chroma subsampling | Size |
 |---|---|---|---|
-| BigGAN 假图 | PNG 100% | 无（PNG） | 128×128 全部 |
-| ADM 假图 | PNG 100% | 无（PNG） | 256×256 全部 |
-| ImageNet 真图 | JPEG 100% | 4:4:4 约 80–90%，4:2:0 约 7–16% | 500×375、375×500 等 |
+| BigGAN fakes | PNG 100% | none (PNG) | all 128×128 |
+| ADM fakes | PNG 100% | none (PNG) | all 256×256 |
+| GLIDE fakes | PNG 100% | none (PNG) | all 256×256 |
+| ImageNet reals | JPEG 100% | 4:4:4 ≈ 80–90%, 4:2:0 ≈ 7–16% | 500×375, 375×500, … |
 
-→ 真假两类在**文件格式**和**分辨率**上都可以被完美区分，这两点都与"是否由 AI 生成"无关。
+→ Real and fake images can be perfectly separated by **file format** and by **resolution**, neither of which has anything to do with being AI-generated.
 
-### 3.2 Baseline 结果（UnivFD 式：冻结 CLIP ViT-B/32 + 逻辑回归，BigGAN 训练 4000 张）
+### 3.2 Baseline results (UnivFD-style: frozen CLIP ViT-B/32 + logistic regression, 4000 BigGAN training images)
 
-| 测试集 | Acc | AUC | 假图召回 | 真图误报 |
+| Test set | Acc | AUC | Fake recall | Real FPR |
 |---|---|---|---|---|
-| BigGAN 测试集（见过） | 99.4 | 1.000 | 99.6% | 0.8% |
-| BigGAN：假图转 JPEG 4:4:4 | 98.5 | 0.998 | – | 1.2% |
-| BigGAN：真图也缩到 128px | 52.6 | 0.848 | – | **94.9%** |
-| BigGAN：模糊 σ=2 | 50.7 | 0.725 | – | **98.7%** |
-| **ADM（未见）** | **61.1** | 0.914 | **22.9%** | 0.7% |
-| ADM：降采样 50% | 92.1 | 0.991 | **99.9%** | 15.7% |
-| ADM：真图缩到 128px（比假图还小） | 17.4 | **0.121** | 23.3% | 88.4% |
+| BigGAN (seen) | 99.4 | 1.000 | 99.6% | 0.8% |
+| BigGAN: fakes → JPEG 4:4:4 | 98.5 | 0.998 | – | 1.2% |
+| BigGAN: reals also resized to 128 px | 52.6 | 0.848 | – | **94.9%** |
+| BigGAN: blur σ = 2 | 50.7 | 0.725 | – | **98.7%** |
+| **ADM (unseen)** | **61.1** | 0.914 | **22.9%** | 0.7% |
+| ADM: downsampled to 50% | 92.1 | 0.991 | **99.9%** | 15.7% |
+| ADM: reals resized to 128 px (smaller than fakes) | 17.4 | **0.121** | 23.3% | 88.4% |
 
-### 3.3 结论
+### 3.3 Conclusions
 
-1. **格式偏差对这个 baseline 影响很小**：假图改成 JPEG 后准确率几乎不变。CLIP 在缩放到 224 的过程中抹掉了细微的压缩痕迹。
-2. **分辨率是主要捷径**：
-   - 真图一旦变小或变糊，几乎全部被判为假图（误报 95–99%）；
-   - ADM 假图（256px）比 BigGAN（128px）清晰，于是 77% 被判为真图；
-   - 把 ADM 降采样后，检测率反而升到 99.9%——**图像质量越差，"检测"越好**；
-   - 真图被缩得比假图还小时，AUC 降到 0.12（排序完全反转）。
-3. 原因：CLIP 默认把所有图缩放到 224。128px 的 BigGAN 被**放大**（变糊），500px 的真图被**缩小**（变锐），模型学到的是"缩放方向"，而不是生成痕迹。
+1. **The format bias has little effect on this baseline**: converting fakes to JPEG barely changes accuracy. Resizing to 224 wipes out subtle compression traces.
+2. **Resolution is the main shortcut**:
+   - once real images become smaller or blurrier, almost all of them are classified as fake (FPR 95–99%);
+   - ADM fakes (256 px) are sharper than BigGAN fakes (128 px), so 77% of them are classified as real;
+   - downsampling ADM images *raises* recall to 99.9% — **the worse the image quality, the better the "detection"**;
+   - when reals are made smaller than the fakes, AUC drops to 0.12 (the ranking is fully inverted).
+3. Cause: CLIP resizes every image to 224. 128 px BigGAN fakes are **upscaled** (blurred) and ~500 px reals are **downscaled** (sharpened), so the model learns the direction of resizing, not generation artifacts.
 
 ---
 
-## 4. 方法设计
+## 4. Method design
 
-### 4.1 预处理对比
+### 4.1 Preprocessing comparison
 
-| | Baseline（resize） | Method A（crop） |
+| | Baseline (resize) | Method A (crop) |
 |---|---|---|
-| 训练 | 短边缩放到 224 → 中心裁剪 224 | **不缩放**，随机裁剪 S×S |
-| 测试 | 同上 | **不缩放**，中心裁剪 S×S |
-| 归一化 | CLIP mean/std | CLIP mean/std（相同） |
-| 主干 | CLIP ViT（冻结） | 同一个 CLIP ViT（冻结），位置编码插值到 S |
-| 分类器 | 逻辑回归，阈值在 val 上按平衡准确率选取 | 相同 |
+| Training | resize short side to 224 → center crop 224 | **no resizing**, random S×S crop |
+| Testing | same as above | **no resizing**, center S×S crop |
+| Normalization | CLIP mean/std | CLIP mean/std (same) |
+| Backbone | frozen CLIP ViT | same frozen CLIP ViT, position embeddings interpolated to S |
+| Classifier | logistic regression, threshold chosen on val by balanced accuracy | same |
 
-### 4.2 关键实现细节
+### 4.2 Implementation details
 
-- **裁剪尺寸 S = 128**：BigGAN 假图只有 128px，S 不能大于最小的训练图尺寸，否则又要放大。
-- **主干用 ViT-B/16**：128px 输入在 B/32 下只有 4×4 = 16 个 patch，B/16 下有 8×8 = 64 个 patch。
-- **位置编码插值**：CLIP 预训练于 224px，使用 transformers 的 `interpolate_pos_encoding=True` 接受 128px 输入。
-- **小于 S 的图像**：只有这类图会被最小限度地放大（例如 `down25` 测试中 32px 的 BigGAN 图）。脚本会统计数量并写入结果 CSV 的 `upscaled` 列，报告中需注明。
-- **训练时多裁剪**（可选 `--train-crops K`）：每张训练图取 K 个随机裁剪，作为数据增强。
-- **公平对比**：resize 与 crop 使用同一份 manifest、同一个分类器和阈值选择方式。**唯一的变量是预处理**。
+- **Crop size S = 128**: BigGAN fakes are only 128 px, so S cannot exceed the smallest training image without upscaling again.
+- **ViT-B/16 backbone**: a 128 px input gives only 4×4 = 16 patches with B/32, but 8×8 = 64 patches with B/16.
+- **Position-embedding interpolation**: CLIP is pre-trained at 224 px; `interpolate_pos_encoding=True` in transformers accepts 128 px inputs.
+- **Images smaller than S**: only these are minimally upscaled (e.g. 32 px BigGAN images in the `down25` test). The script counts them and writes the count to the `upscaled` column of the result CSV; the report must mention it.
+- **Multiple training crops** (optional `--train-crops K`): K random crops per training image as data augmentation.
+- **Training-time JPEG augmentation** (optional `--train-jpeg QMIN QMAX`, added in §10): training images of *both* classes are re-encoded as JPEG with random quality in [QMIN, QMAX] and random 4:4:4 / 4:2:0 subsampling, with probability `--train-jpeg-p` (default 0.5). Val and test images are never touched.
+- **Fair comparison**: resize and crop use the same manifests, classifier and threshold selection. **The only variable is the preprocessing.**
 
-### 4.3 为什么这样能去掉捷径
+### 4.3 Why this should remove the shortcut
 
-裁剪不改变像素的尺度：BigGAN 的 128px 图、ADM 的 256px 图、真图的 500px 图，进入模型时都保持原始的像素密度。模型就不能再通过"被放大了多少"来判断真假，只能依靠图像本身的局部统计特征，也就是生成痕迹。
+Cropping does not change the pixel scale: 128 px BigGAN images, 256 px ADM images and ~500 px real images all enter the model at their native pixel density. The model can no longer tell real from fake by how much an image was rescaled, and has to rely on local image statistics, i.e. generation artifacts.
 
 ---
 
-## 5. 评估协议
+## 5. Evaluation protocol
 
-### 5.1 测试集
+### 5.1 Test sets
 
-| 类别 | 测试集 | 来源 |
+| Category | Test set | Source |
 |---|---|---|
-| 留出（见过的生成器） | `test_seen` | BigGAN 官方 val 全部 12000 张 |
-| 未见生成器 | `test_unseen_adm`（后续加 GLIDE、SD1.4 等） | 官方 val |
-| 偏差控制 | `fake_jpeg444/420`、`real_jpeg420`、`all_jpeg444`、`size_aligned`、`size_jpeg_aligned`、`real_down128` | `make_bias_testsets.py` |
-| 退化 | `jpeg90/70/50`、`blur0.5/1/2`、`down75/50/25` | 同上（与 proposal 第 4 节一致） |
+| Hold-out (seen generator) | `test_seen` | all 12,000 images of the official BigGAN val split |
+| Unseen generators | `test_unseen_adm`, `test_unseen_glide` | official val splits |
+| Bias-controlled | `fake_jpeg444/420`, `real_jpeg420`, `all_jpeg444`, `size_aligned`, `size_jpeg_aligned`, `real_down128` | `make_bias_testsets.py` |
+| Degradations | `jpeg90/70/50`, `blur0.5/1/2`, `down75/50/25` | same script (matches Section 4 of the proposal) |
 
-`size_aligned` 会把真图对齐到**该生成器假图的尺寸**（BigGAN 128px，ADM 256px，SD 512px）。`real_down128` 把真图统一缩到 128px（对 ADM 来说就是"反向尺寸"探针，对应 3.2 中 AUC 0.121 那一行）。
+`size_aligned` resizes reals to **the fake size of that generator** (BigGAN 128 px, ADM/GLIDE 256 px, SD 512 px). `real_down128` resizes reals to 128 px for every generator; for ADM/GLIDE this makes reals *smaller* than fakes, a "reversed size" probe (the AUC 0.121 row in §3.2).
 
-### 5.2 指标
+### 5.2 Metrics
 
-- 主指标：**AUC**（与阈值无关）、**Balanced Accuracy**
-- 同时报告：Acc、Precision、Recall（假图召回）、F1、AP、**真图误报率**
-- 阈值只在 val 上选，测试集不做任何调参
-- 只含假图的测试集（如 EvalGEN）只报告 Recall/TPR
+- Primary: **AUC** (threshold-free) and **balanced accuracy**
+- Also reported: accuracy, precision, recall (fake recall), F1, AP, **real false-positive rate**
+- The threshold is chosen on val only; no tuning on any test set
+- Fake-only test sets (e.g. EvalGEN) report recall / TPR only
 
-### 5.3 实验列表
+### 5.3 Experiment list
 
-| 编号 | 主干 | 预处理 | 目的 | 结果文件 |
-|---|---|---|---|---|
-| E0 | ViT-B/32 | resize | 原始 baseline（已完成，见 3.2） | `results_biggan_bias.csv`（BigGAN 部分）、`results_biggan2adm.csv`（ADM 部分） |
-| E1 | ViT-B/16 | resize | 控制变量：排除"换主干"带来的影响 | `results_resize_b16.csv` |
-| E2 | ViT-B/16 | **crop 128** | **Method A** | `results_crop128_b16.csv` |
-| E3 | ViT-B/16 | crop 128, `--train-crops 4` | 多裁剪增强（消融） | `results_crop128x4_b16.csv` |
-| E4 | E2/E3 中较好的配置 | seed 0/1/2 | 稳定性：报告均值 ± 标准差 | `results_crop128_b16_s{0,1,2}.csv` |
-| E1b | ViT-B/16 | resize + 训练时 JPEG 增强 | 控制变量：JPEG 增强本身的作用 | `results_resize_b16_jpeg.csv` |
-| E2b | ViT-B/16 | **crop 128 + 训练时 JPEG 增强** | **Method A 修正版**：裁剪同时去掉格式捷径 | `results_crop128_b16_jpeg.csv` |
-| E5（下一阶段） | ViT-L/14 | crop 224 vs resize | SD1.4 训练（GenImage 标准协议），测 BigGAN/ADM/GLIDE 等 | 待定 |
+| ID | Backbone | Preprocessing | Purpose | Result file | Status |
+|---|---|---|---|---|---|
+| E0 | ViT-B/32 | resize | original baseline (§3.2) | `results_biggan_bias.csv` (BigGAN), `results_biggan2adm.csv` (ADM) | done |
+| E1 | ViT-B/16 | resize | control: effect of the backbone change | `results_resize_b16.csv` | done |
+| E2 | ViT-B/16 | **crop 128** | **Method A** | `results_crop128_b16.csv` | done |
+| E1b | ViT-B/16 | resize + JPEG aug. | control: effect of JPEG augmentation alone | `results_resize_b16_jpeg.csv` | done |
+| E2b | ViT-B/16 | **crop 128 + JPEG aug.** | **revised Method A**: crop and remove the format shortcut | `results_crop128_b16_jpeg.csv` | done |
+| G1–G4 | ViT-B/16 | resize / crop, + JPEG aug. | BigGAN vs BigGAN+ADM training, GLIDE as unseen | `r_b2g_*.csv`, `r_ba2g_*.csv` | done |
+| E3 | ViT-B/16 | crop 128, `--train-crops 4` | multi-crop augmentation (ablation) | `results_crop128x4_b16.csv` | not run |
+| E4 | best configuration | seeds 0/1/2 | stability: mean ± std | – | not run |
+| E5 | ViT-L/14 | crop 224 vs resize | SD1.4 training (GenImage standard protocol) | – | not run |
 
-**E1 vs E2 是核心对比**：同一主干，只差预处理。
+**E1 vs E2 is the core comparison**: same backbone, only the preprocessing differs.
 
-### 5.4 预期与判断标准
+### 5.4 Success criteria
 
-Method A 有效的标志：
-- `test_unseen_adm` 的 AUC 和假图召回率提升；
-- `size_aligned`、`blur`、`down` 测试中，真图误报率不再接近 100%；
-- `test_seen` 可能略有下降（128px 输入特征变弱）。这是可以接受的代价，需要在报告中如实说明。
+Method A works if:
+- AUC and fake recall on unseen generators improve;
+- the real FPR on `size_aligned`, `blur` and `down` tests is no longer close to 100%;
+- `test_seen` may drop slightly (weaker features at 128 px). This is an acceptable cost and must be reported.
 
 ---
 
-## 6. 运行步骤
+## 6. How to run
 
 ```powershell
-# 0. 重新生成偏差测试集（size_aligned 已改为按生成器尺寸对齐；已存在的其他测试集会自动跳过）
+# bias-controlled test sets (already existing variants are skipped)
 python scripts\make_bias_testsets.py --root data\GenImage_small --manifests manifests_b2a
 python scripts\make_bias_testsets.py --root data\GenImage_small --manifests manifests_b2a --source test_unseen_adm
 
-# E1：ViT-B/16 + resize
+# E1: ViT-B/16 + resize
 python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_b2a --model openai/clip-vit-base-patch16 --out results_resize_b16.csv
-
-# E2：ViT-B/16 + crop 128（Method A）
+# E2: ViT-B/16 + crop 128 (Method A)
 python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_b2a --model openai/clip-vit-base-patch16 --preprocess crop --crop-size 128 --out results_crop128_b16.csv
+# E1b / E2b: + training-time JPEG augmentation
+python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_b2a --model openai/clip-vit-base-patch16 --train-jpeg 70 100 --out results_resize_b16_jpeg.csv
+python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_b2a --model openai/clip-vit-base-patch16 --preprocess crop --crop-size 128 --train-jpeg 70 100 --out results_crop128_b16_jpeg.csv
 
-# E3：多裁剪增强
-python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_b2a --model openai/clip-vit-base-patch16 --preprocess crop --crop-size 128 --train-crops 4 --out results_crop128x4_b16.csv
-
-# 对比表（AUC 和 Acc 各一张）
-python scripts\compare_results.py results_resize_b16.csv results_crop128_b16.csv results_crop128x4_b16.csv --metric auc --out comparison_auc.md
-python scripts\compare_results.py results_resize_b16.csv results_crop128_b16.csv results_crop128x4_b16.csv --metric acc --out comparison_acc.md
+# comparison table
+python scripts\compare_results.py results_resize_b16.csv results_resize_b16_jpeg.csv results_crop128_b16.csv results_crop128_b16_jpeg.csv --metric auc --out comparison_auc_v2.md
 ```
 
-E4 用不同的 `--seed` 重复 E2 或 E3，并改 `--out` 文件名。
+Multi-generator experiment (§12):
+
+```powershell
+python scripts\make_manifest.py --root data\GenImage_small --seen biggan --unseen adm glide --n-train 2000 --n-val 500 --n-test -1 --out manifests_b2g
+python scripts\make_manifest.py --root data\GenImage_small --seen biggan adm --unseen glide --n-train 1000 --n-val 250 --n-test -1 --out manifests_ba2g
+python scripts\make_bias_testsets.py --root data\GenImage_small --manifests manifests_b2g --source test_unseen_glide
+python scripts\make_bias_testsets.py --root data\GenImage_small --manifests manifests_ba2g --source test_unseen_glide
+python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_b2g --model openai/clip-vit-base-patch16 --train-jpeg 70 100 --out r_b2g_resize_jpeg.csv
+python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_ba2g --model openai/clip-vit-base-patch16 --train-jpeg 70 100 --out r_ba2g_resize_jpeg.csv
+python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_b2g --model openai/clip-vit-base-patch16 --preprocess crop --crop-size 128 --train-jpeg 70 100 --out r_b2g_crop_jpeg.csv
+python scripts\train_baseline.py --root data\GenImage_small --manifests manifests_ba2g --model openai/clip-vit-base-patch16 --preprocess crop --crop-size 128 --train-jpeg 70 100 --out r_ba2g_crop_jpeg.csv
+python scripts\compare_results.py r_b2g_resize_jpeg.csv r_ba2g_resize_jpeg.csv r_b2g_crop_jpeg.csv r_ba2g_crop_jpeg.csv --metric auc --out comparison_auc_v3.md
+```
+
+For E4, repeat a configuration with different `--seed` values and different `--out` file names.
 
 ---
 
-## 7. 局限与风险（报告中需要说明）
+## 7. Limitations and risks
 
-1. **物体尺度可能成为新捷径**：从 500px 真图裁 128 看到的是局部；从 128px BigGAN 图裁 128 看到的是整张图。ADM（256px）的结果比 BigGAN 更能说明问题；E5 用 SD1.4（512px）训练可以进一步缓解。
-2. **128px 输入削弱 CLIP 特征**：CLIP 预训练于 224px，`test_seen` 上的准确率可能下降。
-3. **小图仍需放大**：例如 `down25` 中的 32px 图。数量记录在 `upscaled` 列。
-4. **冻结特征 + 线性分类器**：预处理改变的是输入，特征本身不会为任务调整。如果效果有限，可以把同一个预处理模块接到组里可训练的方法（Effort / LoRA）上。
-5. **训练集只有 BigGAN**：这是 BigGAN 上的现象。E5 用 SD1.4 训练，验证结论是否普遍成立。
-
----
-
-## 8. 参考文献
-
-- **GenImage**：Zhu et al., *GenImage: A Million-Scale Benchmark for Detecting AI-Generated Image*, NeurIPS 2023 Datasets & Benchmarks.
-- **UnivFD（起点）**：Ojha, Li, Lee, *Towards Universal Fake Image Detectors that Generalize Across Generative Models*, CVPR 2023.
-- **SAFE（裁剪代替缩放的来源）**：Li et al., *Improving Synthetic Image Detection Towards Generalization: An Image Transformation Perspective*, KDD 2025. arXiv:2408.06741. 代码：github.com/Ouxiang-Li/SAFE
-- **Fake or JPEG?（GenImage 的 JPEG/尺寸偏差）**：Grommelt et al., ECCV 2024 Workshops. arXiv:2403.17608
-- **B-Free（对齐数据、无缩放裁剪）**：Guillaro et al., *A Bias-Free Training Paradigm for More General AI-generated Image Detection*, CVPR 2025. 代码：github.com/grip-unina/B-Free
-- **Aligned Datasets**：Rajan et al., *Aligned Datasets Improve Detection of Latent Diffusion-Generated Images*, ICLR 2025. arXiv:2410.11835
-- **NPR（上采样痕迹）**：Tan et al., *Rethinking the Up-Sampling Operations in CNN-based Generative Network for Generalizable Deepfake Detection*, CVPR 2024.
-- **Effort（组内方法）**：Yan et al., *Orthogonal Subspace Decomposition for Generalizable AI-Generated Image Detection*, ICML 2025.
-- **AIDE**：Yan et al., *A Sanity Check for AI-generated Image Detection*, ICLR 2025. arXiv:2406.19435
+1. **Object scale may become a new shortcut**: a 128 px crop of a ~500 px real image shows a local region, while a 128 px BigGAN image shows the whole scene. Results on ADM/GLIDE (256 px) are more informative than on BigGAN; training on SD1.4 (512 px, E5) would reduce this further.
+2. **128 px inputs weaken CLIP features**: CLIP is pre-trained at 224 px, so accuracy on `test_seen` may drop.
+3. **Small images still need upscaling**: e.g. 32 px images in `down25`; counts are in the `upscaled` column.
+4. **Frozen features + linear classifier**: preprocessing changes the input, but the features are not adapted to the task. The same preprocessing module could be plugged into a trainable method (Effort / LoRA).
+5. **Single seed**: differences of 1–2 points need multiple seeds to be trusted; differences of 20–30 points are reliable.
 
 ---
 
-## 9. 实验记录（每次跑完补充）
+## 8. References
 
-| 日期 | 实验 | 配置 | test_seen AUC | ADM AUC | ADM 召回 | 备注 |
+- **GenImage**: Zhu et al., *GenImage: A Million-Scale Benchmark for Detecting AI-Generated Image*, NeurIPS 2023 Datasets & Benchmarks.
+- **UnivFD (starting point)**: Ojha, Li, Lee, *Towards Universal Fake Image Detectors that Generalize Across Generative Models*, CVPR 2023.
+- **SAFE (source of crop-instead-of-resize)**: Li et al., *Improving Synthetic Image Detection Towards Generalization: An Image Transformation Perspective*, KDD 2025. arXiv:2408.06741. Code: github.com/Ouxiang-Li/SAFE
+- **Fake or JPEG? (JPEG / size biases in GenImage)**: Grommelt et al., ECCV 2024 Workshops. arXiv:2403.17608
+- **B-Free (aligned data, crop without resizing)**: Guillaro et al., *A Bias-Free Training Paradigm for More General AI-generated Image Detection*, CVPR 2025. Code: github.com/grip-unina/B-Free
+- **Aligned Datasets**: Rajan et al., *Aligned Datasets Improve Detection of Latent Diffusion-Generated Images*, ICLR 2025. arXiv:2410.11835
+- **NPR (up-sampling artifacts)**: Tan et al., *Rethinking the Up-Sampling Operations in CNN-based Generative Network for Generalizable Deepfake Detection*, CVPR 2024.
+- **Effort (used in our group)**: Yan et al., *Orthogonal Subspace Decomposition for Generalizable AI-Generated Image Detection*, ICML 2025.
+- **AIDE**: Yan et al., *A Sanity Check for AI-generated Image Detection*, ICLR 2025. arXiv:2406.19435
+
+---
+
+## 9. Experiment log
+
+| Date | Exp. | Configuration | test_seen AUC | Unseen AUC | Unseen recall | Notes |
 |---|---|---|---|---|---|---|
-| 2026-11-04 | E0 | B/32 resize | 1.000 | 0.914 | 22.9% | baseline，见 3.2 |
-| 2026-11-04 | E1 | B/16 resize | 1.000 | 0.939 | – | 换主干后分辨率捷径明显减弱 |
-| 2026-11-04 | E2 | B/16 crop 128 | 0.998 | 0.926 | – | 整体变差，JPEG/模糊测试掉得最多，见第 10 节 |
-| 2026-11-04 | E1b | B/16 resize + JPEG 增强 | 0.999 | 0.924 | 6.4% | ADM JPEG 测试明显变好；ADM 上阈值失效（Acc 53%） |
-| 2026-11-04 | E2b | B/16 crop 128 + JPEG 增强 | 0.996 | 0.884 | 23.4% | 见过数据上的 JPEG 敏感性修好了，ADM 仍然变差，见第 11 节 |
-| | E3 | B/16 crop 128 ×4 | | | | |
+| 2026-11-04 | E0 | B/32 resize, BigGAN train | 1.000 | ADM 0.914 | 22.9% | baseline, §3.2 |
+| 2026-11-04 | E1 | B/16 resize | 1.000 | ADM 0.939 | – | resolution shortcut clearly weaker with B/16 |
+| 2026-11-04 | E2 | B/16 crop 128 | 0.998 | ADM 0.926 | – | worse overall, largest drops on JPEG/blur tests, §10 |
+| 2026-11-04 | E1b | B/16 resize + JPEG aug. | 0.999 | ADM 0.924 | 6.4% | ADM JPEG tests improve; threshold fails on ADM (Acc 53%) |
+| 2026-11-04 | E2b | B/16 crop 128 + JPEG aug. | 0.996 | ADM 0.884 | 23.4% | JPEG sensitivity fixed on seen data, ADM still worse, §11 |
+| 2026-11-04 | G1 | B/16 resize + JPEG, BigGAN | 1.000 | GLIDE 0.991 | – | §12 |
+| 2026-11-04 | G2 | B/16 resize + JPEG, BigGAN+ADM | 0.996 | GLIDE 0.982 | – | resolution shortcut weaker (`real_down128` +23.4) |
+| 2026-11-04 | G3 | B/16 crop + JPEG, BigGAN | 0.996 | GLIDE 0.917 | – | |
+| 2026-11-04 | G4 | B/16 crop + JPEG, BigGAN+ADM | 0.983 | GLIDE 0.977 | – | crop gains most from generator diversity |
+
+`test_seen` in G2/G4 contains BigGAN and ADM, so it is not directly comparable with G1/G3.
 
 ---
 
-## 10. E1 vs E2 结果与分析（2026-11-04）
+## 10. E1 vs E2: results and analysis
 
-AUC（%），完整表格见 `comparison_auc.md`：
+AUC (%); full table in `comparison_auc.md`:
 
-| 测试集 | E1 resize | E2 crop 128 | Δ |
+| Test set | E1 resize | E2 crop 128 | Δ |
 |---|---|---|---|
-| 见过的 BigGAN | 100.0 | 99.8 | −0.2 |
-| 未见的 ADM | 93.9 | 92.6 | −1.3 |
+| BigGAN (seen) | 100.0 | 99.8 | −0.2 |
+| ADM (unseen) | 93.9 | 92.6 | −1.3 |
 | BigGAN size_aligned | 93.1 | 78.1 | −15.0 |
 | ADM size_aligned | 89.1 | 67.5 | −21.7 |
-| ADM 假图转 JPEG 4:4:4 | 92.8 | 86.6 | −6.2 |
+| ADM fakes → JPEG 4:4:4 | 92.8 | 86.6 | −6.2 |
 | ADM jpeg50 | 92.7 | 69.1 | −23.6 |
 | ADM blur1 | 98.0 | 67.5 | −30.5 |
 | BigGAN down25 | 96.3 | 33.3 | −63.0 |
 
-**发现 1：主干 patch 大小影响分辨率捷径。** 同为 resize，B/32 → B/16 后 BigGAN size_aligned AUC 从 0.848 升到 0.931，ADM size_aligned 从 0.854 升到 0.891。E1 作为控制变量是必要的。
+**Finding 1: the backbone patch size affects the resolution shortcut.** With resize in both cases, going from B/32 to B/16 raises BigGAN size_aligned AUC from 0.848 to 0.931 and ADM size_aligned from 0.854 to 0.891. E1 as a control is therefore necessary.
 
-**发现 2：裁剪去掉了分辨率捷径，却暴露了格式捷径。** resize 会缩小 500px 真图，顺带抹平 JPEG 压缩痕迹；crop 保留原始像素，真图的 JPEG 痕迹完整进入模型。由于真图 100% 是 JPEG、假图 100% 是 PNG，模型转而依赖"有没有 JPEG 痕迹"，所以 JPEG 压缩和模糊测试掉得最多。**预处理方式决定了模型利用哪一个偏差。**
+**Finding 2: cropping removes the resolution shortcut but exposes the format shortcut.** Resizing shrinks ~500 px reals and smooths out their JPEG block artifacts; cropping keeps native pixels, so the JPEG traces of reals reach the model intact. Because reals are 100% JPEG and fakes 100% PNG, the model switches to "has JPEG traces = real", which explains why JPEG compression and blur tests drop the most. **The preprocessing choice decides which bias the model exploits.**
 
-**注意：** crop 模式下，down25、blur 等测试中多数图像小于 128px，只能被放大，与训练分布不同，这几项需要谨慎解读（数量见结果 CSV 的 `upscaled` 列）。
+**Caution:** in crop mode, most images in `down25` (and some in other degradation tests) are smaller than 128 px and must be upscaled, unlike in training; interpret these rows with care (counts in the `upscaled` column).
 
-**修正（E2b）：** 训练时对真图和假图都随机做 JPEG 重编码（质量 70–100，4:4:4 / 4:2:0 随机，概率 0.5），让 JPEG 痕迹不再能区分两类。E1b 是同样增强下的 resize 对照。验证的假设：如果格式捷径是 crop 变差的原因，E2b 应明显好于 E2，并接近或超过 E1b。
+**Fix (E2b):** re-encode training images of both classes as JPEG at random (quality 70–100, random 4:4:4 / 4:2:0, probability 0.5) so that JPEG traces no longer separate the classes. E1b is the resize control with the same augmentation. Hypothesis: if the format shortcut caused the drop, E2b should clearly beat E2 and approach or exceed E1b.
 
 ---
 
-## 11. E1b / E2b 结果与结论（2026-11-04）
+## 11. E1b / E2b: results and conclusions
 
-AUC（%），完整表格见 `comparison_auc_v2.md`：
+AUC (%); full table in `comparison_auc_v2.md`:
 
-| 测试集 | E1 resize | E1b resize+JPEG | E2 crop | E2b crop+JPEG |
+| Test set | E1 resize | E1b resize+JPEG | E2 crop | E2b crop+JPEG |
 |---|---|---|---|---|
-| 见过的 BigGAN | 100.0 | 99.9 | 99.8 | 99.6 |
-| **未见的 ADM** | **93.9** | 92.4 | 92.6 | 88.4 |
+| BigGAN (seen) | 100.0 | 99.9 | 99.8 | 99.6 |
+| **ADM (unseen)** | **93.9** | 92.4 | 92.6 | 88.4 |
 | BigGAN jpeg50 | 99.9 | 99.9 | 92.2 | **98.0** |
 | ADM jpeg50 | 92.7 | **96.3** | 69.1 | 77.1 |
 | ADM jpeg90 | 89.5 | **96.3** | 87.1 | 87.8 |
-| ADM 假图转 JPEG 4:4:4 | 92.8 | **94.9** | 86.6 | 85.8 |
+| ADM fakes → JPEG 4:4:4 | 92.8 | **94.9** | 86.6 | 85.8 |
 | ADM size_aligned | **89.1** | 87.8 | 67.5 | 62.3 |
 | ADM blur1 | **98.0** | 97.9 | 67.5 | 65.2 |
 
-**结论 1：JPEG 增强修好了 crop 在"见过的数据"上的 JPEG 敏感性**（BigGAN jpeg50 92.2 → 98.0），说明第 10 节"crop 暴露了格式捷径"的判断部分成立。
+**Conclusion 1: JPEG augmentation fixes crop's JPEG sensitivity on seen data** (BigGAN jpeg50 92.2 → 98.0), partly confirming Finding 2 of §10.
 
-**结论 2：但在未见的 ADM 上，crop 仍然明显落后于 resize**（88–93 vs 92–94；size_aligned 62–68 vs 88–89）。格式捷径只解释了 JPEG 相关测试的一部分差距。剩下的差距更可能来自：
-- 裁剪保留了真图"相机原始分辨率"的像素统计（每个像素包含的细节量），模型把它当成"真"的依据。一旦真图被缩小（size_aligned）或变糊，就被判成假图；
-- 128px 输入下 CLIP 特征变弱；
-- 只用 128px 的 BigGAN 训练，与 SAFE（ProGAN 256px）、B-Free（504px 裁剪）的设定差距很大。
+**Conclusion 2: on unseen ADM, crop still lags clearly behind resize** (88–93 vs 92–94; size_aligned 62–68 vs 88–89). The format shortcut explains only part of the gap on JPEG-related tests. The rest is more likely due to:
+- cropping preserves the camera-resolution pixel statistics of real photos (amount of detail per pixel), which the model treats as evidence of "real"; once reals are downscaled (size_aligned) or blurred, they are classified as fake;
+- weaker CLIP features at 128 px;
+- training only on 128 px BigGAN, far from the settings of SAFE (ProGAN, 256 px) and B-Free (504 px crops).
 
-**结论 3：JPEG 增强对 resize 也有用**（E1b 在 ADM 的 JPEG 类测试上普遍 +2 到 +7），这是本轮最稳定的正结果。
+**Conclusion 3: JPEG augmentation also helps resize** (E1b gains +2 to +7 on ADM JPEG-related tests). This is the most stable positive result of this round.
 
-**结论 4：阈值跨生成器失效。** ADM 上 AUC 有 0.92，但用 BigGAN val 选的阈值时，Acc 只有 53%（E1b），假图召回 6.4%。报告中应同时给 AUC 和 Acc，并单独讨论阈值迁移问题。
+**Conclusion 4: thresholds do not transfer across generators.** On ADM the AUC is 0.92, but with the threshold chosen on BigGAN val, accuracy is only 53% (E1b) and fake recall 6.4%. The report must give both AUC and accuracy and discuss threshold transfer separately.
 
-**注意：** 以上都是单一种子。差距在 1–2 个点的结论需要多种子确认；20–30 个点的差距是可靠的。crop 模式下 down25 测试有约 98% 的图像小于 128px 需要放大，该项对 crop 无效。
-
-**当前判断：** 在"BigGAN 训练 + 冻结 CLIP + 128 裁剪"这个设定下，Method A 是负结果。是否放弃 crop，取决于 E5：用 512px 的 SD1.4 训练、224 裁剪，这才是 crop 的适用场景，也是 GenImage 的标准协议。
+**Caution:** single seed. Differences of 1–2 points need multiple seeds; differences of 20–30 points are reliable. In crop mode about 98% of `down25` images are smaller than 128 px and must be upscaled, so that row is not valid for crop.
 
 ---
 
-## 12. 多生成器训练（BigGAN+ADM）与 GLIDE 测试（2026-11-04）
+## 12. Multi-generator training (BigGAN+ADM) tested on GLIDE
 
-设定：`b2g` = 只用 BigGAN 训练（每类 2000 张）；`ba2g` = BigGAN+ADM 训练（每个生成器每类 1000 张，总量相同）。GLIDE（256px PNG，扩散模型）为两组共同的未见生成器。全部为 ViT-B/16 + 训练时 JPEG 增强，单一种子。AUC（%），完整表格见 `comparison_auc_v3.md`：
+Setup: `b2g` = trained on BigGAN only (2000 images per class); `ba2g` = trained on BigGAN+ADM (1000 per class per generator, same total). GLIDE (256 px PNG, diffusion) is the common unseen generator. All runs use ViT-B/16 + training-time JPEG augmentation, single seed. AUC (%); full table in `comparison_auc_v3.md`:
 
-| GLIDE 测试集 | resize b2g | resize ba2g | crop b2g | crop ba2g |
+| GLIDE test set | resize b2g | resize ba2g | crop b2g | crop ba2g |
 |---|---|---|---|---|
-| 原始 | **99.1** | 98.2 | 91.7 | 97.7 |
-| size_aligned（真图对齐到 256） | **98.5** | 97.4 | 69.0 | 85.2 |
-| real_down128（真图比假图小） | 36.4 | **59.8** | 23.8 | 50.6 |
+| clean | **99.1** | 98.2 | 91.7 | 97.7 |
+| size_aligned (reals → 256 px) | **98.5** | 97.4 | 69.0 | 85.2 |
+| real_down128 (reals smaller than fakes) | 36.4 | **59.8** | 23.8 | 50.6 |
 | jpeg50 | 99.1 | **99.4** | 75.6 | 88.4 |
 | blur1 | **98.0** | 95.2 | 56.1 | 59.7 |
 | down25 | **89.9** | 85.5 | 48.7 | 54.0 |
 
-**结论 1：GLIDE 对这个 baseline 不难。** 只用 BigGAN 训练，GLIDE AUC 就有 99.1，而 ADM 只有 92.2。跨生成器难度很依赖目标生成器。
+**Conclusion 1: GLIDE is easy for this baseline.** Trained on BigGAN only, GLIDE AUC is already 99.1, versus 92.2 on ADM. Cross-generator difficulty depends strongly on the target generator.
 
-**结论 2：生成器多样性削弱了分辨率捷径，但没有提高 GLIDE 上的 AUC。** resize 下加入 ADM 后，GLIDE 原始 AUC 略降（99.1 → 98.2），但 real_down128 从 36.4 升到 59.8（+23.4），说明模型不再那么依赖"小 = 假"。
+**Conclusion 2: generator diversity weakens the resolution shortcut but does not raise GLIDE AUC.** With resize, adding ADM slightly lowers clean GLIDE AUC (99.1 → 98.2, within single-seed noise), but `real_down128` rises from 36.4 to 59.8 (+23.4): the model relies much less on "small = fake".
 
-**结论 3：crop 从多样性中获益最大，但仍不如 resize。** crop 加入 ADM 后，GLIDE +6.0、size_aligned +16.2、jpeg50 +12.8，说明之前 crop 失败有一部分是因为训练数据只有 128px 的 BigGAN。但它在所有测试上仍低于 resize，在模糊和强降采样下接近随机（AUC 54–60）。可能的解释是：裁剪后的模型依赖高频细节，而模糊恰好去掉了这些细节。
+**Conclusion 3: crop benefits most from diversity, but still trails resize.** Adding ADM gives crop +6.0 on GLIDE, +16.2 on size_aligned and +12.8 on jpeg50, so part of crop's earlier failure came from training only on 128 px BigGAN. It nevertheless stays below resize on every test and is close to chance under blur and strong downsampling (AUC 54–60). A likely explanation is that the cropped model depends on high-frequency detail, which blur removes.
 
-**对 Method A 的最终判断：** 在本项目的数据和算力条件下，"裁剪代替缩放"不如"缩放 + JPEG 增强"，不建议作为最终方法。它作为负结果和分析仍有价值：说明预处理会决定模型利用哪种偏差，以及裁剪类方法对训练数据分辨率和多样性的依赖。
+**Final judgement on Method A:** with the data and compute available in this project, crop-instead-of-resize is worse than resize + JPEG augmentation and is not recommended as the final method. It remains valuable as a negative result: it shows that preprocessing determines which bias a detector exploits, and that crop-based methods depend on the resolution and diversity of the training data.
 
-**注意：** GLIDE 在 ba2g 中与训练用的 ADM 同为 256px，size_aligned 一行已对此做了控制。所有结果为单一种子；AUC 在 99 附近的差异（如 99.1 vs 98.2）不足以下结论。
+**Note:** in `ba2g`, GLIDE has the same 256 px size as the ADM training fakes; the size_aligned row controls for this. All results are single-seed; differences around AUC 99 (e.g. 99.1 vs 98.2) are not conclusive.
